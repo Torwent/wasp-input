@@ -1,0 +1,372 @@
+{$DEFINE SRL_DISABLE_REMOTEINPUT}
+{$IFDEF CPU386}
+  const WINAPI_CC = 'stdcall';
+{$ELSE}
+  const WINAPI_CC = 'win64';
+{$ENDIF}
+
+{$loadlib libwindowoverlay}
+
+type TWinMacros = record
+  WM_ACTIVATE, WM_SETFOCUS, WM_KILLFOCUS,
+  WM_MOUSEMOVE,
+  WM_LBUTTONDOWN, WM_LBUTTONUP,
+  WM_RBUTTONDOWN, WM_RBUTTONUP,
+  WM_MBUTTONDOWN, WM_MBUTTONUP,
+  WM_MOUSEWHEEL,
+  WM_XBUTTONDOWN, WM_XBUTTONUP,
+  WM_KEYDOWN, WM_CHAR, WM_KEYUP: UINt32;
+  MouseDown, KeyDown: TBoolArray;
+end;
+
+procedure TWinMacros.Setup();
+begin
+  Self.WM_ACTIVATE    := $0006;
+  Self.WM_SETFOCUS    := $0007;
+  Self.WM_KILLFOCUS   := $0008;
+
+  Self.WM_MOUSEMOVE   := $0200;
+
+  Self.WM_LBUTTONDOWN := $0201;
+  Self.WM_LBUTTONUP   := $0202;
+
+  Self.WM_RBUTTONDOWN := $0204;
+  Self.WM_RBUTTONUP   := $0205;
+
+  Self.WM_MBUTTONDOWN := $0207;
+  Self.WM_MBUTTONUP   := $0208;
+
+  Self.WM_MOUSEWHEEL  := $020A;
+  Self.WM_XBUTTONDOWN := $020B;
+  Self.WM_XBUTTONUP   := $020C;
+
+  Self.WM_KEYDOWN     := $0100;
+  Self.WM_KEYUP       := $0101;
+  Self.WM_CHAR        := $0102;
+  //This next 2 are basically hashmaps to retrieve values fast.
+  SetLength(Self.MouseDown, $F);
+  SetLength(Self.KeyDown, $FF);
+end;
+
+function TWinMacros.MakeWord(bLow, bHigh: Byte): Dword; static;
+begin
+  Result := (bHigh shl 16) or bLow;
+end;
+
+function TWinMacros.MakeLong(wLow, wHigh: Word): Dword; static;
+begin
+  Result := (wHigh shl 16) or wLow;
+end;
+
+function TWinMacros.MakeLParam(wLow, wHigh: Word): Pointer; static;
+begin
+  PtrUInt(Result) := TWinMacros.MakeLong(wLow, wHigh);
+end;
+
+function TWinMacros.MakeWParam(wLow, wHigh: Word): PtrUInt; static;
+begin
+  Result := (wHigh shl 16) or wLow;
+end;
+
+function TWinMacros.SendMessage(
+  hwnd: TOSWindow; event: UInt32; wParam: PtrUInt; lParam: Pointer
+): UInt32; static;
+external 'SendMessageA@user32.dll ' + WINAPI_CC;
+
+function TWinMacros.PostMessage(
+  hwnd: TOSWindow; event: UInt32; wParam: PtrUInt; lParam: Pointer
+): UInt32; static;
+external 'PostMessageW@User32.dll ' + WINAPI_CC;
+
+function TWinMacros.SendInput(
+  win: TOSWindow; event: UInt32; wParam: PtrUInt; lParam: UInt32
+): UInt32; static; overload;
+external 'SendMessageA@user32.dll stdcall';
+
+type TWaspInput = record
+  Window: TOSWindow;
+  Macros: TWinMacros;
+  Mouse: TPoint;
+  Overlay: TWindowOverlay;
+end;
+
+procedure TWaspInput.Setup();
+begin
+  Self.Window := GetSimbaTargetWindow();
+  Self.Macros.Setup();
+  Self.Overlay := TWindowOverlay.Create(Self.Window);
+  AddOnTerminate(@Self.Overlay.Free);
+end;
+
+function TWaspInput.SendMouseEvent(event: UInt32; wParam: PtrUInt; x, y: Int32): UInt32;
+begin
+  Result := TWinMacros.PostMessage(
+              Self.Window, event, wParam, TWinMacros.MakeLParam(x, y));
+
+  case event of
+    Self.Macros.WM_LBUTTONDOWN, Self.Macros.WM_RBUTTONDOWN,
+    Self.Macros.WM_MBUTTONDOWN, Self.Macros.WM_XBUTTONDOWN:
+      begin
+        Self.Macros.MouseDown[event and $F] := True;
+      end;
+    Self.Macros.WM_LBUTTONUP, Self.Macros.WM_RBUTTONUP,
+    Self.Macros.WM_MBUTTONUP, Self.Macros.WM_XBUTTONUP:
+      begin
+        Self.Macros.MouseDown[event and $F - 1] := False;
+      end;
+  end;
+end;
+
+function TWaspInput.SendMouseEvent(event: UInt32; wParam: PtrUInt = 0): UInt32; overload;
+begin
+  Result := Self.SendMouseEvent(event, wParam, Self.Mouse.X, Self.Mouse.Y);
+end;
+
+function TWaspInput.MouseMove(x, y: Int32): UInt32;
+var
+  old: TPoint;
+begin
+  old := Self.Mouse;
+  Self.Mouse := [x, y];
+
+  Result := Self.SendMouseEvent(Self.Macros.WM_MOUSEMOVE, 0);
+
+  Self.Overlay.BeginUpdate();
+  Self.Overlay.Bitmap.DrawCircleFilled(old.X, old.Y, 2, False, 0);
+  Self.Overlay.Bitmap.DrawCircleFilled(x, y, 2, False, $FFFFFF);
+  Self.Overlay.EndUpdate();
+end;
+
+function TWaspInput.MouseClick(button: Int32; down: Boolean): UInt32;
+var
+  event: UInt32;
+begin
+  case button of
+    MOUSE_EXTRA_1, MOUSE_EXTRA_2: event := Self.Macros.WM_XBUTTONDOWN;
+    MOUSE_LEFT:   event := Self.Macros.WM_LBUTTONDOWN;
+    MOUSE_RIGHT:  event := Self.Macros.WM_RBUTTONDOWN;
+    MOUSE_MIDDLE: event := Self.Macros.WM_MBUTTONDOWN;
+  end;
+
+  if not down then
+    event += 1;
+  Result := Self.SendMouseEvent(event);
+end;
+
+function TWaspInput.MouseScroll(down: Boolean): UInt32;
+var
+  value: Int32;
+begin
+  if down then
+    value := -120
+  else
+    value := 120;
+
+  Result := Self.SendMouseEvent(Self.Macros.WM_MOUSEWHEEL, TWinMacros.MakeWParam(0, value));
+end;
+
+function TWaspInput.SendKeyboardEvent(event: UInt32; key: UInt32): UInt32;
+var
+  flags: UInt32;
+begin
+  case event of
+    Self.Macros.WM_KEYDOWN: flags := $20000000;
+    Self.Macros.WM_KEYUP, Self.Macros.WM_CHAR: flags := $C0000000;
+    else flags := 0;
+  end;
+  Result := TWinMacros.PostMessage(Self.Window, event, key, Pointer(flags));
+  Self.Macros.KeyDown[key] := event = Self.Macros.WM_KEYDOWN;
+end;
+
+function TWaspInput.SendKeyboardEvent(key: UInt32; down: Boolean): UInt32; overload;
+var
+  event: UInt32;
+begin
+  if down then
+    event := Self.Macros.WM_KEYDOWN
+  else
+    event := Self.Macros.WM_KEYUP;
+  Result := Self.SendKeyboardEvent(event, key);
+end;
+
+
+function TWaspInput.ActivateWindow(): UInt32;
+var
+  windows: TOSWindowArray;
+  win: TOSWindow;
+begin
+  windows := GetWindows();
+
+  repeat
+    win := windows[Random(0, High(windows))];
+  until win <> Self.Window;
+
+  Result := TWinMacros.PostMessage(
+              Self.Window, Self.Macros.WM_ACTIVATE,
+              TWinMacros.MakeWParam(1, 0), Pointer(win)
+            );
+end;
+
+function TWaspInput.GainFocus(): UInt32;
+var
+  windows: TOSWindowArray;
+  win: TOSWindow;
+begin
+  windows := GetWindows();
+
+  repeat
+    win := windows[Random(0, High(windows))];
+  until win <> Self.Window;
+
+  Result := TWinMacros.PostMessage(
+              Self.Window, Self.Macros.WM_SETFOCUS, win, nil);
+end;
+
+function TWaspInput.LoseFocus(): UInt32;
+begin
+  Result := TWinMacros.PostMessage(
+              Self.Window, Self.Macros.WM_KILLFOCUS, 0, nil);
+end;
+
+var
+  WaspInput: TWaspInput;
+
+begin
+  WaspInput.Setup();
+end;
+
+//MOUSE OVERRIDES
+procedure ClickMouse(x, y, clickType: Int32); override;
+begin
+  WaspInput.MouseMove(x, y);
+  WaspInput.MouseClick(clickType, True);
+  WaspInput.MouseClick(clickType, False);
+end;
+
+procedure GetMousePos(var x,y: Int32); override
+begin
+  x := WaspInput.Mouse.X;
+  y := WaspInput.Mouse.Y;
+end;
+
+procedure HoldMouse(x, y, clickType: Int32); override;
+begin
+  WaspInput.MouseMove(x, y);
+  WaspInput.MouseClick(clickType, True);
+end;
+
+procedure MoveMouse(x, y: Int32); override;
+begin
+  WaspInput.MouseMove(x, y);
+end;
+
+procedure ReleaseMouse(x, y, clickType: Int32); override;
+begin
+  WaspInput.MouseMove(x, y);
+  WaspInput.MouseClick(clickType, False);
+end;
+
+procedure ScrollMouse(x, y, clicks: Int32); override
+var
+  i: Int32;
+begin
+  if clicks = 0 then
+    Exit;
+
+  WaspInput.MouseMove(x, y);
+  if clicks > 0 then
+    for i := 0 to clicks do
+      WaspInput.MouseScroll(True);
+
+  if clicks < 0 then
+    for i := 0 to clicks do
+      WaspInput.MouseScroll(False);
+end;
+
+function IsMouseButtonDown(button: Int32): Boolean; override;
+begin
+  case button of
+    MOUSE_EXTRA_1, MOUSE_EXTRA_2:
+      button := WaspInput.Macros.WM_XBUTTONDOWN;
+    MOUSE_LEFT:   button := WaspInput.Macros.WM_LBUTTONDOWN;
+    MOUSE_RIGHT:  button := WaspInput.Macros.WM_RBUTTONDOWN;
+    MOUSE_MIDDLE: button := WaspInput.Macros.WM_MBUTTONDOWN;
+  end;
+  Result := WaspInput.Macros.MouseDown[button];
+end;
+
+//KEYBOARD OVERRIDES
+function isKeyDown(key: UInt16): Boolean; override;
+begin
+  Result := WaspInput.Macros.KeyDown[key];
+end;
+
+procedure KeyDown(key: UInt16); override;
+begin
+   WaspInput.SendKeyboardEvent(key, True);
+end;
+
+procedure KeyUp(key: UInt16); override;
+begin
+  WaspInput.SendKeyboardEvent(key, False);
+end;
+
+procedure PressKey(key: UInt16); override;
+begin
+  WaspInput.SendKeyboardEvent(key, True);
+  WaspInput.SendKeyboardEvent(key, False);
+end;
+
+//Thanks to Twinki14 NAS for this.
+procedure SendKeys(const s: String; keyWait, {$H-}keyModWait: Int32); {$H+} override;
+var
+  i, z, ls, lsc: Integer;
+  sC: String;
+  special: boolean;
+begin
+  sc:='!@#$%^&*()-_=+[{]}\|;:",<.>/?~`';
+  ls := length(s);
+  lsc := length(sc);
+  for i:=1 to ls do
+  begin
+    for z:=1 to lsc do
+      if(s[i] = sc[z]) then
+        special := True;
+
+    if ((not (s[i] in ['0'..'9'])) and ((s[i]=Uppercase(s[i])) or special)) then
+      WaspInput.SendKeyboardEvent(WaspInput.Macros.WM_CHAR, PtrUInt(s[i]))
+    else
+      PressKey(GetKeyCode(s[i]));
+
+    sleep(keywait);
+  end;
+end;
+
+//uptext position is different on c++ client, at least in fixed mode.
+procedure TRSMainScreen.SetupAlignment(Mode: ERSClientMode); override;
+begin
+  inherited;
+
+  case Self.Mode of
+    ERSClientMode.RESIZABLE_CLASSIC, ERSClientMode.RESIZABLE_MODERN:
+      begin
+        Self.Alignment.Left := [@RootInterface.X1];
+        Self.Alignment.Right := [@RootInterface.X2];
+        Self.Alignment.Top := [@RootInterface.Y1];
+        Self.Alignment.Bottom := [@RootInterface.Y2];
+
+        Self.UpTextArea := [3, 3, 500, 21];
+      end;
+
+    ERSClientMode.FIXED:
+      begin
+        Self.Alignment.Left := [@RootInterface.X1, 4];
+        Self.Alignment.Right := [@RootInterface.X1, 515];
+        Self.Alignment.Top := [@RootInterface.Y1, 4];
+        Self.Alignment.Bottom := [@RootInterface.Y1, 337];
+
+        Self.UpTextArea := [4, 5, 500, 25];
+      end;
+  end;
+end;
+
